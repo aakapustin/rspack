@@ -477,8 +477,10 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         .is_some_and(|c| matches!(c, Utf8Component::RootDir | Utf8Component::Prefix(_)))
     );
     if self.options.prefer_absolute {
-      if let Ok(Some(path)) = self.load_absolute(specifier, ctx).await {
-        return Ok(path);
+      match self.load_absolute(specifier, ctx).await {
+        Ok(Some(path)) => return Ok(path),
+        Err(err) if err.is_ignore() => return Err(err),
+        _ => {}
       }
     }
     if let Some(path) = self.load_roots(specifier, ctx).await {
