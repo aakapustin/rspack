@@ -728,7 +728,7 @@ A list of resolve restrictions to restrict the paths that a request can be resol
 - **Type:** `string[]`
 - **Default:** `[]`
 
-A list of directories where server-relative URLs (beginning with '/') are resolved. On systems other than Windows, these requests are initially resolved as an absolute path.
+Directories to search for server-relative requests such as `/images/logo.svg`, in the order listed. By default, Rspack searches these directories before trying the absolute path. With `resolve.preferAbsolute` or `resolve.preferRelative` enabled, it tries the absolute path first. When `resolve.extensionAlias` applies, Rspack searches all locations for one extension before trying the next.
 
 For example, importing `'/static/app.js'` and expecting it to resolve relative to the project root:
 

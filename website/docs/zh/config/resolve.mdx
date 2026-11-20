@@ -726,7 +726,7 @@ export default {
 - **类型：** `string[]`
 - **默认值：**`[]`
 
-一个目录列表，用于解析服务器相对 URL（以'/'开头的 URL）。在非 Windows 系统上，这些请求首先作为绝对路径进行解析。
+指定解析 `/images/logo.svg` 这类以 `/` 开头的请求时要查找的目录。默认按配置顺序查找这些目录，最后尝试绝对路径。开启 `resolve.preferAbsolute` 或 `resolve.preferRelative` 后，先尝试绝对路径。如果请求命中了 `resolve.extensionAlias`，Rspack 会用同一个扩展名查完所有位置，再尝试下一个扩展名。
 
 例如，导入 `'/static/app.js'` 时，期望其相对于项目根目录进行解析：
 

@@ -118,6 +118,17 @@ pub use crate::{
 type ResolveResult = Result<Option<CachedPath>, ResolveError>;
 type FxDashSet<T> = DashSet<T, FxBuildHasher>;
 
+/// A speculative lookup can miss, but an explicitly ignored module ends resolution.
+fn optional_candidate(
+  result: Result<impl Into<Option<CachedPath>>, ResolveError>,
+) -> ResolveResult {
+  match result {
+    Ok(candidate) => Ok(candidate.into()),
+    Err(err) if err.is_ignore() => Err(err),
+    Err(_) => Ok(None),
+  }
+}
+
 /// Context returned from the [Resolver::resolve_with_context] API
 #[derive(Debug, Default, Clone)]
 pub struct ResolveContext {
@@ -403,7 +414,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     let result = match Utf8Path::new(specifier).components().next() {
       // 2. If X begins with '/'
       Some(Utf8Component::RootDir | Utf8Component::Prefix(_)) => {
-        self.require_absolute(specifier, ctx).await
+        self.require_absolute(cached_path, specifier, ctx).await
       }
       // 3. If X begins with './' or '/' or '../'
       Some(Utf8Component::CurDir | Utf8Component::ParentDir) => {
@@ -466,6 +477,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
 
   async fn require_absolute(
     &self,
+    issuer: &CachedPath,
     specifier: &str,
     ctx: &mut Ctx,
   ) -> Result<CachedPath, ResolveError> {
@@ -476,34 +488,76 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         .next()
         .is_some_and(|c| matches!(c, Utf8Component::RootDir | Utf8Component::Prefix(_)))
     );
-    if self.options.prefer_absolute {
-      match self.load_absolute(specifier, ctx).await {
-        Ok(Some(path)) => return Ok(path),
-        Err(err) if err.is_ignore() => return Err(err),
-        _ => {}
+    if let Some(path) = self
+      .load_package_alias(issuer, Some(specifier), ctx)
+      .await?
+    {
+      return Ok(path);
+    }
+    let path = self.absolute_path(specifier);
+    if !self.options.roots.is_empty()
+      && specifier.starts_with('/')
+      && !self.options.resolve_to_context
+    {
+      if let Some((source, extensions)) = self
+        .extension_alias(path.path())
+        .filter(|(source, _)| specifier.ends_with(source))
+      {
+        // ExtensionAliasPlugin tries each spelling through all roots before the next spelling.
+        if let Some(path) = self
+          .load_extension_alias(&path, Some(specifier), ctx)
+          .await?
+        {
+          return Ok(path);
+        }
+        if !extensions.contains(source) {
+          return Err(ResolveError::NotFound(specifier.to_string()));
+        }
       }
     }
-    if let Some(path) = self.load_roots(specifier, ctx).await {
-      return Ok(path);
+
+    for (candidate, request) in self.absolute_candidates(&path, specifier) {
+      let result = self
+        .load_as_file_or_directory(&candidate, specifier, request, ctx)
+        .await;
+      if let Some(path) = optional_candidate(result)? {
+        return Ok(path);
+      }
     }
-    if let Some(path) = self.load_absolute(specifier, ctx).await? {
-      return Ok(path);
-    }
-    Err(ResolveError::NotFound(specifier.to_string()))
+    self
+      .load_as_file_or_directory(&path, specifier, None, ctx)
+      .await?
+      .ok_or_else(|| ResolveError::NotFound(specifier.to_string()))
   }
 
-  // 2. If X begins with '/'
-  //   a. set Y to be the file system root
-  async fn load_absolute(&self, specifier: &str, ctx: &mut Ctx) -> ResolveResult {
-    let path = self.cache.value(
-      //
+  fn absolute_path(&self, specifier: &str) -> CachedPath {
+    self.cache.value(
       #[cfg(windows)]
       &Utf8Path::new(specifier).normalize(),
       #[cfg(not(windows))]
       Utf8Path::new(specifier),
-    );
+    )
+  }
 
-    self.load_as_file_or_directory(&path, specifier, ctx).await
+  /// RootsPlugin changes the candidate path but retains the server-relative request for aliases.
+  fn absolute_candidates<'a>(
+    &'a self,
+    absolute: &'a CachedPath,
+    specifier: &'a str,
+  ) -> impl Iterator<Item = (CachedPath, Option<&'a str>)> + 'a {
+    let roots = &self.options.roots;
+    let absolute_first =
+      self.options.prefer_absolute || (self.options.prefer_relative && !roots.is_empty());
+    let rooted = roots.iter().filter_map(move |root| {
+      let subpath = specifier.strip_prefix('/')?;
+      let root = Utf8Path::from_path(root).expect("path should be UTF-8");
+      let candidate = self.cache.value(&root.join(subpath).normalize());
+      Some((candidate, Some(specifier)))
+    });
+    absolute_first
+      .then(|| (absolute.clone(), None))
+      .into_iter()
+      .chain(rooted)
   }
 
   // 3. If X begins with './' or '/' or '../'
@@ -529,7 +583,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     // a. LOAD_AS_FILE(Y + X)
     // b. LOAD_AS_DIRECTORY(Y + X)
     if let Some(path) = self
-      .load_as_file_or_directory(&cached_path, specifier, ctx)
+      .load_as_file_or_directory(&cached_path, specifier, None, ctx)
       .await?
     {
       return Ok(path);
@@ -572,7 +626,9 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         .is_some_and(|c| matches!(c, Utf8Component::Normal(_)))
     );
     if self.options.prefer_relative {
-      if let Ok(path) = self.require_relative(cached_path, specifier, ctx).await {
+      if let Some(path) =
+        optional_candidate(self.require_relative(cached_path, specifier, ctx).await)?
+      {
         return Ok(path);
       }
     }
@@ -606,7 +662,9 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         .take()
         .expect("fragment presence is checked above");
       let path = format!("{specifier}{fragment}");
-      if let Ok(path) = self.require_without_parse(cached_path, &path, ctx).await {
+      if let Some(path) =
+        optional_candidate(self.require_without_parse(cached_path, &path, ctx).await)?
+      {
         return Ok((parsed, Some(path)));
       }
       ctx.fragment.replace(fragment);
@@ -669,14 +727,23 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
   }
 
   #[cfg_attr(feature="enable_instrument", tracing::instrument(level=tracing::Level::DEBUG, skip_all, fields(path = cached_path.path().as_str())))]
-  async fn load_as_file(&self, cached_path: &CachedPath, ctx: &mut Ctx) -> ResolveResult {
-    // enhanced-resolve feature: extension_alias
-    if let Some(path) = self.load_extension_alias(cached_path, ctx).await? {
-      return Ok(Some(path));
+  async fn load_as_file(
+    &self,
+    cached_path: &CachedPath,
+    alias_request: Option<&str>,
+    ctx: &mut Ctx,
+  ) -> ResolveResult {
+    if alias_request.is_none() {
+      if let Some(path) = self.load_extension_alias(cached_path, None, ctx).await? {
+        return Ok(Some(path));
+      }
     }
     if self.options.enforce_extension.is_disabled() {
       // 1. If X is a file, load X as its file extension format. STOP
-      if let Some(path) = self.load_alias_or_file(cached_path, ctx).await? {
+      if let Some(path) = self
+        .load_alias_or_file(cached_path, alias_request, ctx)
+        .await?
+      {
         return Ok(Some(path));
       }
     }
@@ -684,7 +751,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     // 3. If X.json is a file, parse X.json to a JavaScript Object. STOP
     // 4. If X.node is a file, load X.node as binary addon. STOP
     if let Some(path) = self
-      .load_extensions(cached_path, &self.options.extensions, ctx)
+      .load_extensions(cached_path, &self.options.extensions, alias_request, ctx)
       .await?
     {
       return Ok(Some(path));
@@ -692,7 +759,12 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     Ok(None)
   }
 
-  async fn load_as_directory(&self, cached_path: &CachedPath, ctx: &mut Ctx) -> ResolveResult {
+  async fn load_as_directory(
+    &self,
+    cached_path: &CachedPath,
+    alias_request: Option<&str>,
+    ctx: &mut Ctx,
+  ) -> ResolveResult {
     // TODO: Only package.json is supported, so warn about having other values
     // Checking for empty files is needed for omitting checks on package.json
     // 1. If X/package.json is a file,
@@ -715,11 +787,12 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
           let main_field_path = cached_path.path().normalize_with(main_field.as_ref());
           // d. LOAD_AS_FILE(M)
           let cached_path = self.cache.value(&main_field_path);
-          if let Ok(Some(path)) = self.load_as_file(&cached_path, ctx).await {
+          if let Some(path) = optional_candidate(self.load_as_file(&cached_path, None, ctx).await)?
+          {
             return Ok(Some(path));
           }
           // e. LOAD_INDEX(M)
-          if let Some(path) = self.load_index(&cached_path, ctx).await? {
+          if let Some(path) = self.load_index(&cached_path, None, ctx).await? {
             return Ok(Some(path));
           }
         }
@@ -728,7 +801,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
       }
     }
     // 2. LOAD_INDEX(X)
-    self.load_index(cached_path, ctx).await
+    self.load_index(cached_path, alias_request, ctx).await
   }
 
   #[cfg_attr(feature="enable_instrument", tracing::instrument(level=tracing::Level::DEBUG, skip_all, fields(specifier = specifier, path = cached_path.path().as_str())))]
@@ -736,6 +809,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     &self,
     cached_path: &CachedPath,
     specifier: &str,
+    alias_request: Option<&str>,
     ctx: &mut Ctx,
   ) -> ResolveResult {
     if self.options.resolve_to_context {
@@ -747,12 +821,15 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
       );
     }
     if !specifier.ends_with('/') {
-      if let Some(path) = self.load_as_file(cached_path, ctx).await? {
+      if let Some(path) = self.load_as_file(cached_path, alias_request, ctx).await? {
         return Ok(Some(path));
       }
     }
     if cached_path.is_dir(&self.cache.fs, ctx).await {
-      if let Some(path) = self.load_as_directory(cached_path, ctx).await? {
+      if let Some(path) = self
+        .load_as_directory(cached_path, alias_request, ctx)
+        .await?
+      {
         return Ok(Some(path));
       }
     }
@@ -764,6 +841,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     &self,
     path: &CachedPath,
     extensions: &[String],
+    alias_request: Option<&str>,
     ctx: &mut Ctx,
   ) -> ResolveResult {
     if ctx.fully_specified {
@@ -779,7 +857,10 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
       path_with_extension_buffer.truncate(base_len);
       path_with_extension_buffer.push_str(extension);
       let cached_path = self.cache.value(Utf8Path::new(&path_with_extension_buffer));
-      if let Some(path) = self.load_alias_or_file(&cached_path, ctx).await? {
+      if let Some(path) = self
+        .load_alias_or_file(&cached_path, alias_request, ctx)
+        .await?
+      {
         return Ok(Some(path));
       }
     }
@@ -825,12 +906,20 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
   }
 
   #[cfg_attr(feature="enable_instrument", tracing::instrument(level=tracing::Level::DEBUG, skip_all, fields(path = cached_path.path().as_str())))]
-  async fn load_index(&self, cached_path: &CachedPath, ctx: &mut Ctx) -> ResolveResult {
+  async fn load_index(
+    &self,
+    cached_path: &CachedPath,
+    alias_request: Option<&str>,
+    ctx: &mut Ctx,
+  ) -> ResolveResult {
     for main_file in &self.options.main_files {
       let main_path = cached_path.path().normalize_with(main_file);
       let cached_path = self.cache.value(&main_path);
       if self.options.enforce_extension.is_disabled() {
-        if let Some(path) = self.load_alias_or_file(&cached_path, ctx).await? {
+        if let Some(path) = self
+          .load_alias_or_file(&cached_path, alias_request, ctx)
+          .await?
+        {
           if self.check_restrictions(path.path()) {
             return Ok(Some(path));
           }
@@ -840,7 +929,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
       // 2. If X/index.json is a file, parse X/index.json to a JavaScript object. STOP
       // 3. If X/index.node is a file, load X/index.node as binary addon. STOP
       if let Some(path) = self
-        .load_extensions(&cached_path, &self.options.extensions, ctx)
+        .load_extensions(&cached_path, &self.options.extensions, alias_request, ctx)
         .await?
       {
         return Ok(Some(path));
@@ -849,22 +938,14 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     Ok(None)
   }
 
-  async fn load_alias_or_file(&self, cached_path: &CachedPath, ctx: &mut Ctx) -> ResolveResult {
-    if !self.options.alias_fields.is_empty() {
-      if let Some(package_json) = cached_path
-        .find_package_json(&self.cache.fs, &self.options, ctx)
-        .await?
-      {
-        if let Some(path) = self
-          .load_browser_field(cached_path, None, &package_json, ctx)
-          .await?
-        {
-          return Ok(Some(path));
-        }
-      }
-    }
+  async fn load_alias_or_file(
+    &self,
+    cached_path: &CachedPath,
+    alias_request: Option<&str>,
+    ctx: &mut Ctx,
+  ) -> ResolveResult {
     // enhanced-resolve: try file as alias
-    let alias_specifier = cached_path.path().as_str();
+    let alias_specifier = alias_request.unwrap_or_else(|| cached_path.path().as_str());
     if let Some(path) = self
       .load_alias(
         cached_path,
@@ -873,6 +954,12 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         &self.alias_trie,
         ctx,
       )
+      .await?
+    {
+      return Ok(Some(path));
+    }
+    if let Some(path) = self
+      .load_package_alias(cached_path, alias_request, ctx)
       .await?
     {
       return Ok(Some(path));
@@ -977,25 +1064,25 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     if cached_path.path().file_name() == Some("node_modules")
       && specifier == package_name
       && !self.options.resolve_to_context
-      && !self.matches_extension_alias(file_cached.path())
+      && self.extension_alias(file_cached.path()).is_none()
       && file_cached.is_dir(&self.cache.fs, ctx).await
     {
       if self.options.enforce_extension.is_disabled() {
-        if let Some(path) = self.load_alias_or_file(&file_cached, ctx).await? {
+        if let Some(path) = self.load_alias_or_file(&file_cached, None, ctx).await? {
           return Ok(Some(path));
         }
       }
       // Failed directory resolution can mutate query, fragment, and alias state.
       // Keep its dependencies without leaking those changes into file resolution.
       if let Some(path) = ctx
-        .trace_dependencies_only(async |ctx| self.load_as_directory(&file_cached, ctx).await)
+        .trace_dependencies_only(async |ctx| self.load_as_directory(&file_cached, None, ctx).await)
         .await?
       {
         return Ok(Some(path));
       }
     }
     self
-      .load_as_file_or_directory(&file_cached, specifier, ctx)
+      .load_as_file_or_directory(&file_cached, specifier, None, ctx)
       .await
   }
 
@@ -1146,9 +1233,16 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         let inner_resolver = self.clone_with_options(inner_options);
 
         // try as file or directory `path` in the pnp folder
-        let Ok(inner_resolution) = inner_resolver.resolve(&path, &inner_request).await else {
-          return Err(ResolveError::NotFound(specifier.to_string()));
-        };
+        let inner_resolution = inner_resolver
+          .resolve(&path, &inner_request)
+          .await
+          .map_err(|err| {
+            if err.is_ignore() {
+              err
+            } else {
+              ResolveError::NotFound(specifier.to_string())
+            }
+          })?;
 
         Ok(Some(self.cache.value(
           Utf8Path::from_path(inner_resolution.path()).expect("path should be UTF-8"),
@@ -1267,7 +1361,10 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     // 2. If the file at RESOLVED_PATH exists, load RESOLVED_PATH as its extension format. STOP
     //
     // Non-compliant ESM can result in a directory, so directory is tried as well.
-    if let Some(path) = self.load_as_file_or_directory(cached_path, "", ctx).await? {
+    if let Some(path) = self
+      .load_as_file_or_directory(cached_path, "", None, ctx)
+      .await?
+    {
       return Ok(Some(path));
     }
 
@@ -1279,7 +1376,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     while let Some(s) = path_str {
       if let Some((before, _)) = s.rsplit_once('?') {
         if (self
-          .load_as_file_or_directory(&self.cache.value(Utf8Path::new(before)), "", ctx)
+          .load_as_file_or_directory(&self.cache.value(Utf8Path::new(before)), "", None, ctx)
           .await?)
           .is_some()
         {
@@ -1293,6 +1390,26 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
 
     // 3. THROW "not found"
     Err(ResolveError::NotFound(specifier.to_string()))
+  }
+
+  async fn load_package_alias(
+    &self,
+    cached_path: &CachedPath,
+    request: Option<&str>,
+    ctx: &mut Ctx,
+  ) -> ResolveResult {
+    if self.options.alias_fields.is_empty() {
+      return Ok(None);
+    }
+    let Some(package_json) = cached_path
+      .find_package_json(&self.cache.fs, &self.options, ctx)
+      .await?
+    else {
+      return Ok(None);
+    };
+    self
+      .load_browser_field(cached_path, request, &package_json, ctx)
+      .await
   }
 
   /// enhanced-resolve: AliasFieldPlugin for [ResolveOptions::alias_fields]
@@ -1449,14 +1566,16 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     Ok(None)
   }
 
-  fn matches_extension_alias(&self, path: &Utf8Path) -> bool {
-    path.extension().is_some_and(|extension| {
-      self
-        .options
-        .extension_alias
-        .iter()
-        .any(|(alias, _)| alias.trim_start_matches('.') == extension)
-    })
+  fn extension_alias(&self, path: &Utf8Path) -> Option<&(String, Vec<String>)> {
+    if self.options.extension_alias.is_empty() {
+      return None;
+    }
+    let extension = path.extension()?;
+    self
+      .options
+      .extension_alias
+      .iter()
+      .find(|(alias, _)| alias.trim_start_matches('.') == extension)
   }
 
   /// Given an extension alias map `{".js": [".ts", ".js"]}`,
@@ -1467,34 +1586,41 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
   /// # Errors
   ///
   /// * [ResolveError::ExtensionAlias]: When all of the aliased extensions are not found
-  async fn load_extension_alias(&self, cached_path: &CachedPath, ctx: &mut Ctx) -> ResolveResult {
-    if self.options.extension_alias.is_empty() {
-      return Ok(None);
-    }
-    let Some(path_extension) = cached_path.path().extension() else {
-      return Ok(None);
-    };
-    let Some((_, extensions)) = self
-      .options
-      .extension_alias
-      .iter()
-      .find(|(ext, _)| ext.trim_start_matches('.') == path_extension)
-    else {
-      return Ok(None);
-    };
+  async fn load_extension_alias(
+    &self,
+    cached_path: &CachedPath,
+    server_request: Option<&str>,
+    ctx: &mut Ctx,
+  ) -> ResolveResult {
     let path = cached_path.path();
+    let Some((_, extensions)) = self.extension_alias(path) else {
+      return Ok(None);
+    };
     let Some(filename) = path.file_name() else {
       return Ok(None);
     };
-    let path_without_extension = path.with_extension("");
-
+    let request = server_request.unwrap_or_else(|| path.as_str());
+    let (stem, _) = request
+      .rsplit_once('.')
+      .expect("extension alias requires a file extension");
     ctx.with_fully_specified(true);
     for extension in extensions {
-      let mut path_with_extension = path_without_extension.clone().into_string();
-      path_with_extension.reserve_exact(extension.len());
-      path_with_extension.push_str(extension);
-      let cached_path = self.cache.value(Utf8Path::new(&path_with_extension));
-      if let Some(path) = self.load_alias_or_file(&cached_path, ctx).await? {
+      let candidate = format!("{stem}{extension}");
+      let path = if server_request.is_some() {
+        let absolute = self.absolute_path(&candidate);
+        for (path, request) in self.absolute_candidates(&absolute, &candidate) {
+          if let Some(path) =
+            optional_candidate(self.load_alias_or_file(&path, request, ctx).await)?
+          {
+            ctx.with_fully_specified(false);
+            return Ok(Some(path));
+          }
+        }
+        absolute
+      } else {
+        self.cache.value(Utf8Path::new(&candidate))
+      };
+      if let Some(path) = self.load_alias_or_file(&path, None, ctx).await? {
         ctx.with_fully_specified(false);
         return Ok(Some(path));
       }
@@ -1526,29 +1652,6 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     ))
   }
 
-  /// enhanced-resolve: RootsPlugin
-  ///
-  /// A list of directories where requests of server-relative URLs (starting with '/') are resolved,
-  /// defaults to context configuration option.
-  ///
-  /// On non-Windows systems these requests are resolved as an absolute path first.
-  async fn load_roots(&self, specifier: &str, ctx: &mut Ctx) -> Option<CachedPath> {
-    if self.options.roots.is_empty() {
-      return None;
-    }
-    if let Some(specifier) = specifier.strip_prefix(SLASH_START) {
-      for root in &self.options.roots {
-        let cached_path = self
-          .cache
-          .value(Utf8Path::from_path(root).expect("path should be UTF-8"));
-        if let Ok(path) = self.require_relative(&cached_path, specifier, ctx).await {
-          return Some(path);
-        }
-      }
-    }
-    None
-  }
-
   async fn load_tsconfig_paths(
     &self,
     cached_path: &CachedPath,
@@ -1570,7 +1673,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
     let paths = tsconfig.resolve(cached_path.path(), specifier);
     for path in paths {
       let cached_path = self.cache.value(&path);
-      if let Ok(path) = self.require_relative(&cached_path, ".", ctx).await {
+      if let Some(path) = optional_candidate(self.require_relative(&cached_path, ".", ctx).await)? {
         return Ok(Some(path));
       }
     }
@@ -2272,7 +2375,7 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
             ));
           }
           // 2. For each item targetValue in target, do
-          for (i, target_value) in targets.iter().enumerate() {
+          for target_value in targets.iter() {
             // 1. Let resolved be the result of PACKAGE_TARGET_RESOLVE( packageURL, targetValue, patternMatch, isImports, conditions), continuing the loop on any Invalid Package Target error.
             let resolved = self
               .package_target_resolve(
@@ -2286,18 +2389,12 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
               )
               .await;
 
-            if resolved.is_err() && i == targets.len() {
-              return resolved;
-            }
-
             // 2. If resolved is undefined, continue the loop.
-            if let Ok(Some(path)) = resolved {
+            if let Some(path) = optional_candidate(resolved)? {
               // 3. Return resolved.
               return Ok(Some(path));
             }
           }
-          // 3. Return or throw the last fallback resolution null return or error.
-          // Note: see `resolved.is_err() && i == targets.len()`
         }
         JSONValue::Static(_) => {}
       }
