@@ -353,9 +353,7 @@ fn to_rspack_resolver_options(
     .exports_fields
     .unwrap_or_else(|| vec![vec!["exports".to_string()]]);
   let extension_alias = options.extension_alias.unwrap_or_default();
-  let alias_fields = options
-    .alias_fields
-    .unwrap_or_else(|| vec![vec![String::from("browser")]]);
+  let alias_fields = options.alias_fields.unwrap_or_default();
   let restrictions = options
     .restrictions
     .unwrap_or_default()
