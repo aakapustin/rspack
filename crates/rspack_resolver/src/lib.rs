@@ -1550,8 +1550,15 @@ impl<Fs: FileSystem + Send + Sync> ResolverGeneric<Fs> {
         if tail.is_empty() {
           Cow::Borrowed(alias_value)
         } else {
-          let normalized = alias_path.normalize_with(tail);
-          Cow::Owned(normalized.into_string())
+          let normalized = alias_path.normalize_with(tail).into_string();
+          // A server-relative alias is still a URL request when it reaches roots.
+          #[cfg(windows)]
+          let normalized = if alias_value.starts_with('/') && !alias_value.starts_with("//") {
+            normalized.replace('\\', "/")
+          } else {
+            normalized
+          };
+          Cow::Owned(normalized)
         }
       };
 
